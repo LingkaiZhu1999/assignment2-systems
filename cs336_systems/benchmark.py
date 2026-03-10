@@ -1,10 +1,17 @@
 import torch
 import timeit
 import pandas as pd
+import math
 from typing import Callable
 import torch.cuda.nvtx as nvtx
+from torch import Tensor
+from jaxtyping import Bool, Float
+from einops import einsum
 
+import cs336_basics.model as basics_model
 from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.optimizer import AdamW
+from cs336_basics.nn_utils import cross_entropy, clip_gradient, softmax
 
 # hyperparameters
 vocab_size = 10000
@@ -20,8 +27,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 use_bf16 = False 
 model_dtype = torch.bfloat16 if use_bf16 else torch.float32
 num_warmups = 5
-num_trials = 10
-benchmark_modes = ["forward_only", "forward_backward", "backward_only"]
+num_trials = 1
 
 def mean(lst: list[float]) -> float:
     return sum(lst) / len(lst)
@@ -29,6 +35,48 @@ def mean(lst: list[float]) -> float:
 def stddev(lst: list[float]) -> float:
     m = mean(lst)
     return (sum((x - m) ** 2 for x in lst) / len(lst)) ** 0.5
+
+@nvtx.range("scaled_dot_product_attention")
+def annotated_scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys    d_k"],
+    V: Float[Tensor, " ... keys    d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+    """Scaled dot-product attention.
+
+    This function implements Eq. 1 of the Transformer paper.
+
+    Args:
+        Q: Tensor of queries, may have any number of leading dimensions.
+        K: Tensor of keys, sharing leading dimensions with Q.
+        V: Tensor of values, sharding leading dimensions with Q and K.
+        mask: An (optional) mask of shape (..., seq_len, seq_len).
+            Attention scores for positions with a mask value of `False` should
+            be masked out, i.e., not affect the softmaxed attention probabilities.
+
+    Returns:
+        torch.FloatTensor of shape (..., seq_len, value_dimension)
+        with the output of running your scaled dot product attention
+        implementation with the provided key, query, and value tensors.
+    """
+
+    d_k = K.shape[-1]
+    with nvtx.range("computing attention scores"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+
+    if mask is not None:
+        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+
+    with nvtx.range("computing softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+
+    with nvtx.range("final matmul"):
+        output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    
+    return output
+
+basics_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 def get_model(size, context_length, rope_theta=10000.):
     return BasicsTransformerLM(vocab_size,
@@ -38,109 +86,57 @@ def get_model(size, context_length, rope_theta=10000.):
         num_heads[size],
         d_ff[size],
         rope_theta,)
-
-def synchronize_if_cuda() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
-def benchmark(
-    description: str,
-    run: Callable,
+        
+def profiling(
+    model,
+    data,
     num_warmups: int = 1,
     num_trials: int = 10,
-    run_returns_time_ms: bool = False,
+    optimizer: torch.optim.Optimizer = None,
 ):
     """Benchmark `run` for `num_trials` and return (mean_ms, stddev_ms)."""
     # Warmup: first times might be slower due to compilation, things not cached.
     # Since we will run the kernel multiple times, the timing that matters is steady state.
-    with nvtx.range(f"{description} | warmup"):
-        for _ in range(num_warmups):
-            run()
-        synchronize_if_cuda()  # Wait for CUDA threads to finish (important!)
 
-    # Time it for real now!
-    times: list[float] = [] # @inspect times, @inspect description
-    for i in range(num_trials):  # Do it multiple times to capture variance
-        with nvtx.range(f"{description} | measured {i}"):
-            if run_returns_time_ms:
-                times.append(float(run()))
-                continue
+    for i in range(num_warmups+num_trials):  # Do it multiple times to capture variance
+        if i >= num_warmups:
+            torch.cuda.cudart().cudaProfilerStart()  # Start CUDA profiler after warmup iterations
+        
+        nvtx.range_push(f"step {i}")
 
-            start_time = timeit.default_timer()
-            run()  # Actually perform computation
-            synchronize_if_cuda()  # Wait for CUDA threads to finish (important!)
-            end_time = timeit.default_timer()
-            times.append((end_time - start_time) * 1000) # @inspect times
-
-    mean_time = mean(times) # @inspect mean_time
-    stddev_time = stddev(times) # @inspect stddev_time
-    return mean_time, stddev_time
-
-def run_forward_only(model, data):
-    with torch.no_grad():
-        out = model(data)
-        _ = out.mean()
-
-
-def run_forward_backward(model, data, optimizer):
-    optimizer.zero_grad(set_to_none=True)
-    out = model(data)
-    loss = out.mean()
-    loss.backward()
-
-
-def run_backward_only(model, data, optimizer) -> float:
-    # Build graph first, then time backward only.
-    optimizer.zero_grad(set_to_none=True)
-    out = model(data)
-    loss = out.mean()
-
-    synchronize_if_cuda()
-    start_time = timeit.default_timer()
-    loss.backward()
-    synchronize_if_cuda()
-    end_time = timeit.default_timer()
-    return (end_time - start_time) * 1000
-
-print(f"device={device}, use_bf16={use_bf16}")
-data = torch.randint(0, vocab_size, (batch_size, 128), device=device) # @inspect data
-time_list = []
-for mode in benchmark_modes:
-    print(f"\nRunning mode: {mode}")
-    for s in size:
-        model = get_model(s, context_length=128).to(device=device, dtype=model_dtype) # @inspect
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-
-        if mode == "forward_only":
-            model.eval()
-            run_fn = lambda model=model, data=data: run_forward_only(model, data)
-            returns_time_ms = False
-        elif mode == "forward_backward":
-            model.train()
-            run_fn = lambda model=model, data=data, optimizer=optimizer: run_forward_backward(model, data, optimizer)
-            returns_time_ms = False
+        if optimizer:
+            optimizer.zero_grad(set_to_none=True)
         else:
-            model.train()
-            run_fn = lambda model=model, data=data, optimizer=optimizer: run_backward_only(model, data, optimizer)
-            returns_time_ms = True
+            model.zero_grad(set_to_none=True)
+        
+        with nvtx.range("forward"):
+            y = model(data).mean()
+        
+        with nvtx.range("loss"):
+            loss = cross_entropy(model(data), data[:, 1:])
+        with nvtx.range("backward"):
+            y.backward()
 
-        elapsed_ms = benchmark(
-            f"{mode} | Model size {s}",
-            run_fn,
-            num_warmups=num_warmups,
-            num_trials=num_trials,
-            run_returns_time_ms=returns_time_ms,
-        )
-        time_list.append((mode, s, d_model[s], d_ff[s], num_layers[s], num_heads[s], elapsed_ms[0], elapsed_ms[1]))
-        print(f"Mode {mode}, model size {s}: {elapsed_ms[0]:.2f} ms (± {elapsed_ms[1]:.2f} ms)")
+        if optimizer:
+            with nvtx.range("optimizer_step"):
+                optimizer.step()
+        
+        # torch.cuda.synchronize()
 
-print("Benchmarking complete. Results:")
-results_df = pd.DataFrame(
-    time_list,
-    columns=["mode", "model_size", "d_model", "d_ff", "num_layers", "num_heads", "time_ms", "stddev_ms"],
-)
-markdown_path = f"./benchmark_results_{model_dtype}_all_modes_warmup_{num_warmups}.md"
-with open(markdown_path, "w", encoding="utf-8") as f:
-    f.write(results_df.to_markdown(index=False))
-print(f"Results saved to {markdown_path}")
+        nvtx.range_pop()  # End of step
+
+def main():
+    basics_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+    print(f"device={device}, use_bf16={use_bf16}")
+    with nvtx.range("define_input"):
+        data = torch.randint(0, vocab_size, (batch_size, 128), device=device) 
+    for s in size:
+        with nvtx.range(f"define_model_{s}"):
+            model = get_model(s, context_length=128).to(device=device, dtype=model_dtype) 
+        with nvtx.range(f"define_optimizer_{s}"):
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        print(f"Benchmarking size={s}...")
+        profiling(model, data, num_warmups=num_warmups, num_trials=num_trials, optimizer=optimizer)
+
+if __name__ == "__main__":
+    main()
