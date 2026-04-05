@@ -24,7 +24,7 @@ class FlashAttention(torch.autograd.Function):
             O = torch.zeros((batch, B_q, d), device=Q.device)
             l = torch.zeros((batch, B_q, ), device=Q.device)
             m = torch.full((batch, B_q, ), -torch.inf, device=Q.device)
-            
+
             for j in range(T_k):
                 K_block, V_block = tiled_K[:, j], tiled_V[:, j]
                 S = einsum(Q_block, K_block, "... B_q d, ... B_k d -> ... B_q B_k") / math.sqrt(d)
@@ -32,10 +32,11 @@ class FlashAttention(torch.autograd.Function):
                 m = torch.maximum(m, torch.max(S, dim=-1).values)
                 P = torch.exp(S - rearrange(m, "... B_q -> ... B_q 1"))
                 l = torch.exp(m_prev - m) * l + torch.sum(P, dim=-1)
-                O = einsum(torch.diag_embed(torch.exp(m_prev - m)), O, "... B_q B_q, ... B_q d -> ... B_q d") + \
+                O = rearrange(torch.exp(m_prev - m),"... -> ... 1") * O + \
                 einsum(P, V_block, "... B_q B_k, ... B_k d -> ... B_q d")
 
-            O = einsum(torch.diag_embed(1./l), O, "... B_q B_q, ... B_q d -> ... B_q d")
+            # O = einsum(torch.diag_embed(1./l), O, "... B_q B_q, ... B_q d -> ... B_q d")
+            O = O / rearrange(l, "... -> ... 1")
             L = m + torch.log(l)
             O_full[:, i*B_q: B_q*(i+1), :] = O
             L_full[:, i*B_q: B_q*(i+1)] = L
