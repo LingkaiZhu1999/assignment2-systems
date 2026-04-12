@@ -232,13 +232,13 @@ def flash_bwd_kernel(Q_ptr, dQ_ptr, K_ptr, dK_ptr, V_ptr, dV_ptr,
         else:
             S = tl.dot(Q_block, tl.trans(K_block)) * scale
         P = tl.exp(S - L_block[:, None])
-        dV_block += tl.dot(tl.trans(P), dO_block)
+        dV_block += tl.dot(tl.trans(tl.cast(P, dtype=dO_block.dtype)), dO_block)
         dP = tl.dot(dO_block, tl.trans(V_block))
         dS = P * (dP - D_block[:, None]) * scale
         if IS_CAUSAL:
             dS = tl.where(mask, dS, 0.0)
         
-        dQ_block = tl.dot(dS, K_block)
+        dQ_block = tl.dot(tl.cast(dS, dtype=K_block.dtype), K_block)
         q_offsets = i * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
         dQ_ptrs = (
             dQ_ptr
@@ -249,7 +249,7 @@ def flash_bwd_kernel(Q_ptr, dQ_ptr, K_ptr, dK_ptr, V_ptr, dV_ptr,
         dQ_mask = (q_offsets[:, None] < N_QUERIES) & (d_offsets[None, :] < D)
         tl.atomic_add(dQ_ptrs, dQ_block, mask=dQ_mask)
 
-        dK_block += tl.dot(tl.trans(dS), Q_block)
+        dK_block += tl.dot(tl.trans(tl.cast(dS, dtype=Q_block.dtype)), Q_block)
 
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))

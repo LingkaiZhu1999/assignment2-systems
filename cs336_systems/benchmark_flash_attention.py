@@ -10,7 +10,7 @@ def test_timing_flash_forward_backward():
     q, k, v = torch.randn(
         (3, n_heads, sequence_length, d_head), device='cuda', dtype=torch.bfloat16, requires_grad=True  
                           )  
-    flash = torch.compile(FlashAttention2.apply)  
+    flash = FlashAttention2.apply
 
     def flash_forward_backward(): 
         o = flash(q, k, v, True) 
